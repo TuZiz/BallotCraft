@@ -7,7 +7,7 @@ authors: [ ymxc ]
 commands:
   ballotcraft:
     description: BallotCraft vote command
-    usage: /ballotcraft start <player> [reason]
+    usage: /ballotcraft start <player> <reason>
     aliases: [ ballot, bcvote ]
 permissions:
   ballotcraft.start:

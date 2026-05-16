@@ -32,6 +32,7 @@ data class BallotCraftConfig(
         val openSeconds: Long,
         val syncPollSeconds: Long,
         val onlineHeartbeatSeconds: Long,
+        val onlineCleanupSeconds: Long,
         val onlineExpireSeconds: Long,
         val blackExcessMultiplier: Double,
         val minBlackVotesToSanction: Int,

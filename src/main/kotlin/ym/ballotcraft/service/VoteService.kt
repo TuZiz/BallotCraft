@@ -7,6 +7,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.withContext
@@ -24,6 +25,7 @@ import org.bukkit.entity.Player
 import ym.ballotcraft.BallotCraftConfig
 import ym.ballotcraft.BallotCraftPlugin
 import ym.ballotcraft.model.OnlinePlayerSnapshot
+import ym.ballotcraft.model.OnlinePlayerSnapshotForWrite
 import ym.ballotcraft.model.VoteChoice
 import ym.ballotcraft.model.VoteResolution
 import ym.ballotcraft.model.VoteResolutionType
@@ -37,7 +39,9 @@ import java.time.Duration
 import java.time.Instant
 import java.util.Locale
 import java.util.UUID
+import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.logging.Level
 
@@ -54,18 +58,25 @@ class VoteService(
     private val bossBars = ConcurrentHashMap<UUID, ConcurrentHashMap<Long, BossBar>>()
     private val announcedSessions = ConcurrentHashMap.newKeySet<Long>()
     private val deliveredSessions = ConcurrentHashMap<UUID, MutableSet<Long>>()
+    private val knownOnlinePlayers = ConcurrentHashMap.newKeySet<UUID>()
+    private val knownOnlinePlayerNames = ConcurrentHashMap<UUID, String>()
     private val ready = AtomicBoolean(false)
     private val serverId = config.database.serverId
     private val reasonsById = config.vote.reasons.associateBy { it.id.lowercase(Locale.ROOT) }
+
+    private data class CommandPlayerSnapshot(
+        val uuid: UUID,
+        val name: String,
+        val canStart: Boolean,
+        val canVote: Boolean,
+        val bypassCooldown: Boolean,
+    )
 
     fun startAsync(onReady: () -> Unit, onFailure: (Throwable) -> Unit) {
         scope.launch {
             runCatching {
                 withContext(ioDispatcher) {
                     repository.initialize()
-                    if (config.storage.usesMysql) {
-                        repository.purgeExpiredOnlinePlayers(Instant.now().minusSeconds(config.vote.onlineExpireSeconds))
-                    }
                 }
             }.onSuccess {
                 ready.set(true)
@@ -76,6 +87,7 @@ class VoteService(
                 if (config.storage.usesMysql) {
                     scheduleSyncPoll()
                     scheduleOnlineHeartbeat()
+                    scheduleOnlineCleanup()
                     scope.launch {
                         syncOnlinePlayersNow()
                     }
@@ -91,19 +103,22 @@ class VoteService(
     fun shutdown() {
         ready.set(false)
         if (config.storage.usesMysql) {
-            val onlinePlayers = Bukkit.getOnlinePlayers().map { it.uniqueId }
-            scope.launch {
-                withContext(ioDispatcher) {
-                    onlinePlayers.forEach { uuid ->
-                        repository.removeOnlinePlayer(serverId, uuid)
+            val onlinePlayers = knownOnlinePlayers.toList()
+            val removed = runBlocking {
+                withTimeoutOrNull(3_000L) {
+                    withContext(ioDispatcher) {
+                        repository.removeOnlinePlayersBatch(serverId, onlinePlayers)
                     }
+                    true
                 }
+            } ?: false
+            if (!removed && onlinePlayers.isNotEmpty()) {
+                plugin.logger.warning("Timed out while removing online player heartbeats during shutdown.")
             }
         }
         scope.cancel()
         bossBars.forEach { (uuid, playerBossBars) ->
-            val player = Bukkit.getPlayer(uuid) ?: return@forEach
-            scheduler.executeFor(player) {
+            executeIfPlayerOnline(uuid) { player ->
                 playerBossBars.values.forEach { bossBar ->
                     bossBar.removePlayer(player)
                     bossBar.isVisible = false
@@ -113,6 +128,8 @@ class VoteService(
         bossBars.clear()
         deliveredSessions.clear()
         announcedSessions.clear()
+        knownOnlinePlayers.clear()
+        knownOnlinePlayerNames.clear()
     }
 
     fun handleCommand(sender: CommandSender, args: Array<out String>): Boolean {
@@ -157,11 +174,11 @@ class VoteService(
         }
         if (args.size == 2 && sender is Player) {
             return when (args[0].lowercase(Locale.ROOT)) {
-                "start" -> Bukkit.getOnlinePlayers()
+                "start" -> knownOnlinePlayerNames.values
                     .asSequence()
-                    .map(Player::getName)
                     .filter { !it.equals(sender.name, ignoreCase = true) }
                     .filter { it.startsWith(args[1], ignoreCase = true) }
+                    .distinct()
                     .toList()
 
                 else -> emptyList()
@@ -179,53 +196,58 @@ class VoteService(
     }
 
     fun onPlayerJoin(player: Player) {
-        clearPlayerState(player.uniqueId)
-        if (!ready.get()) {
-            return
-        }
-        scope.launch {
-            if (config.storage.usesMysql) {
-                withContext(ioDispatcher) {
-                    repository.heartbeatOnlinePlayer(
-                        serverId,
-                        player.uniqueId,
-                        player.name,
-                        player.hasPermission(config.permissions.exemptTarget),
-                        Instant.now(),
-                    )
+        scheduler.executeFor(player) {
+            val now = Instant.now()
+            val snapshot = onlineSnapshotForWrite(player, now) ?: return@executeFor
+            rememberOnlineSnapshots(listOf(snapshot))
+            clearPlayerState(snapshot.uuid)
+            if (!ready.get()) {
+                return@executeFor
+            }
+            scope.launch {
+                if (config.storage.usesMysql) {
+                    withContext(ioDispatcher) {
+                        repository.heartbeatOnlinePlayersBatch(serverId, listOf(snapshot), now)
+                    }
                 }
-            }
-            val sessions = withContext(ioDispatcher) {
-                repository.findActiveSessions(Instant.now())
-            }
-            sessions.forEach { session ->
-                notifySinglePlayer(player, session)
+                val sessions = withContext(ioDispatcher) {
+                    repository.findActiveSessions(Instant.now())
+                }
+                sessions.forEach { session ->
+                    notifySinglePlayer(player, session)
+                }
             }
         }
     }
 
     fun onPlayerQuit(player: Player) {
-        clearPlayerState(player.uniqueId)
-        if (!ready.get() || !config.storage.usesMysql) {
-            return
-        }
-        scope.launch {
-            withContext(ioDispatcher) {
-                repository.removeOnlinePlayer(serverId, player.uniqueId)
+        scheduler.executeFor(player) {
+            val uuid = player.uniqueId
+            forgetOnlinePlayer(uuid)
+            clearPlayerState(uuid)
+            if (!ready.get() || !config.storage.usesMysql) {
+                return@executeFor
+            }
+            scope.launch {
+                withContext(ioDispatcher) {
+                    repository.removeOnlinePlayersBatch(serverId, listOf(uuid))
+                }
             }
         }
     }
 
     fun handleVoteClick(voter: Player, sessionId: Long, choice: VoteChoice) {
-        if (!ready.get()) {
-            sendPrefixed(voter, config.messages.systemUnavailable)
-            return
-        }
-        if (!voter.hasPermission(config.permissions.vote)) {
-            sendPrefixed(voter, config.messages.noPermission)
-            return
-        }
-        scope.launch {
+        scheduler.executeFor(voter) {
+            if (!ready.get()) {
+                sendPrefixed(voter, config.messages.systemUnavailable)
+                return@executeFor
+            }
+            val voterSnapshot = commandSnapshot(voter)
+            if (!voterSnapshot.canVote) {
+                sendPrefixed(voter, config.messages.noPermission)
+                return@executeFor
+            }
+            scope.launch {
             val now = Instant.now()
             val session = withContext(ioDispatcher) {
                 repository.findActiveSessionById(sessionId, now)
@@ -236,7 +258,7 @@ class VoteService(
             }
 
             val existingVote = withContext(ioDispatcher) {
-                repository.findVote(sessionId, voter.uniqueId)
+                repository.findVote(sessionId, voterSnapshot.uuid)
             }
             if (existingVote != null && existingVote.choice == choice) {
                 sendForPlayer(voter, config.messages.voteDuplicate)
@@ -248,7 +270,7 @@ class VoteService(
             }
 
             val tally = withContext(ioDispatcher) {
-                repository.upsertVote(sessionId, voter.uniqueId, voter.name, choice, now)
+                repository.upsertVote(sessionId, voterSnapshot.uuid, voterSnapshot.name, choice, now)
             }
             if (tally == null) {
                 sendForPlayer(voter, config.messages.voteClosed)
@@ -265,6 +287,7 @@ class VoteService(
                 resolveLiveSession(session, tally, VoteResolutionType.SANCTIONED)
             } else {
                 refreshBossBarsForSession(session.id)
+            }
             }
         }
     }
@@ -288,33 +311,30 @@ class VoteService(
     }
 
     private fun startVoteCommand(sender: Player, args: Array<out String>) {
-        if (!sender.hasPermission(config.permissions.start)) {
-            sendPrefixed(sender, config.messages.noPermission)
-            return
-        }
-        if (args.size < 3) {
-            sendPrefixed(sender, config.messages.usage)
-            return
-        }
+        scheduler.executeFor(sender) {
+            val senderSnapshot = commandSnapshot(sender)
+            if (!senderSnapshot.canStart) {
+                sendPrefixed(sender, config.messages.noPermission)
+                return@executeFor
+            }
+            if (args.size < 3) {
+                sendPrefixed(sender, config.messages.usage)
+                return@executeFor
+            }
 
-        val targetName = args[1]
-        val localTarget = Bukkit.getPlayerExact(targetName)
-        val reasonInput = args[2]
-        val reason = findReason(reasonInput)
-        if (reason == null) {
-            sendPrefixed(sender, config.messages.reasonNotFound, "reason" to reasonInput)
-            return
-        }
-        if (localTarget != null && localTarget.uniqueId == sender.uniqueId) {
-            sendPrefixed(sender, config.messages.cannotTargetSelf)
-            return
-        }
+            val targetName = args[1]
+            val reasonInput = args[2]
+            val reason = findReason(reasonInput)
+            if (reason == null) {
+                sendPrefixed(sender, config.messages.reasonNotFound, "reason" to reasonInput)
+                return@executeFor
+            }
 
-        scope.launch {
+            scope.launch {
             val now = Instant.now()
-            if (!sender.hasPermission(config.permissions.bypassCooldown)) {
+            if (!senderSnapshot.bypassCooldown) {
                 val remaining = withContext(ioDispatcher) {
-                    computeRemainingCooldown(sender.uniqueId, now)
+                    computeRemainingCooldown(senderSnapshot.uuid, now)
                 }
                 if (remaining > 0L) {
                     sendForPlayer(sender, config.messages.cooldown, "seconds" to remaining)
@@ -322,7 +342,7 @@ class VoteService(
                 }
             }
 
-            val targetSnapshot = resolveTargetSnapshot(localTarget, targetName, now)
+            val targetSnapshot = resolveTargetSnapshot(targetName, now)
             if (targetSnapshot == null) {
                 sendForPlayer(sender, config.messages.targetOffline)
                 return@launch
@@ -331,7 +351,7 @@ class VoteService(
                 sendForPlayer(sender, config.messages.targetProtected, "target" to targetSnapshot.playerName)
                 return@launch
             }
-            if (targetSnapshot.playerUuid == sender.uniqueId) {
+            if (targetSnapshot.playerUuid == senderSnapshot.uuid) {
                 sendForPlayer(sender, config.messages.cannotTargetSelf)
                 return@launch
             }
@@ -340,13 +360,13 @@ class VoteService(
                 repository.createSessionIfAbsent(
                     targetUuid = targetSnapshot.playerUuid,
                     targetName = targetSnapshot.playerName,
-                    startedByUuid = sender.uniqueId,
-                    startedByName = sender.name,
+                    startedByUuid = senderSnapshot.uuid,
+                    startedByName = senderSnapshot.name,
                     reason = reason.id,
                     createdAt = now,
                     expiresAt = now.plusSeconds(config.vote.openSeconds),
                 )?.also {
-                    repository.updateStarterCooldown(sender.uniqueId, now)
+                    repository.updateStarterCooldown(senderSnapshot.uuid, now)
                 }
             }
 
@@ -364,15 +384,16 @@ class VoteService(
                 "reason_description" to reasonDescription(reason.id),
             )
             broadcastVoteStarted(result.session)
+            }
         }
     }
 
-    private suspend fun resolveTargetSnapshot(localTarget: Player?, targetName: String, now: Instant): OnlinePlayerSnapshot? {
-        if (localTarget != null && localTarget.isOnline) {
+    private suspend fun resolveTargetSnapshot(targetName: String, now: Instant): OnlinePlayerSnapshot? {
+        findLocalOnlinePlayerSnapshot(targetName, now)?.let { snapshot ->
             return OnlinePlayerSnapshot(
-                playerUuid = localTarget.uniqueId,
-                playerName = localTarget.name,
-                exemptFromVote = localTarget.hasPermission(config.permissions.exemptTarget),
+                playerUuid = snapshot.uuid,
+                playerName = snapshot.name,
+                exemptFromVote = snapshot.exempt,
             )
         }
         if (!config.storage.usesMysql) {
@@ -542,6 +563,19 @@ class VoteService(
         }
     }
 
+    private fun scheduleOnlineCleanup() {
+        val delayTicks = config.vote.onlineCleanupSeconds.coerceAtLeast(60L) * 20L
+        scheduler.runLaterGlobal(delayTicks) {
+            if (!ready.get()) {
+                return@runLaterGlobal
+            }
+            scope.launch {
+                cleanupOnlinePlayers()
+                scheduleOnlineCleanup()
+            }
+        }
+    }
+
     private fun scheduleBossBarRefresh() {
         val delayTicks = config.bossBar.updateIntervalTicks.coerceAtLeast(1L)
         scheduler.runLaterGlobal(delayTicks) {
@@ -600,9 +634,6 @@ class VoteService(
                     repository.markResolutionDelivered(resolution.session.id, serverId)
                 }
             }
-            withContext(ioDispatcher) {
-                repository.purgeExpiredOnlinePlayers(now.minusSeconds(config.vote.onlineExpireSeconds))
-            }
         } catch (exception: Exception) {
             plugin.logger.log(Level.WARNING, "Failed to poll shared vote sessions", exception)
         }
@@ -610,17 +641,17 @@ class VoteService(
 
     private suspend fun syncOnlinePlayersNow() {
         val now = Instant.now()
+        val snapshots = collectOnlinePlayerSnapshots(now)
+        rememberOnlineSnapshots(snapshots)
         withContext(ioDispatcher) {
-            repository.purgeExpiredOnlinePlayers(now.minusSeconds(config.vote.onlineExpireSeconds))
-            Bukkit.getOnlinePlayers().forEach { player ->
-                repository.heartbeatOnlinePlayer(
-                    serverId,
-                    player.uniqueId,
-                    player.name,
-                    player.hasPermission(config.permissions.exemptTarget),
-                    now,
-                )
-            }
+            repository.heartbeatOnlinePlayersBatch(serverId, snapshots, now)
+        }
+    }
+
+    private suspend fun cleanupOnlinePlayers() {
+        val expireBefore = Instant.now().minusSeconds(config.vote.onlineExpireSeconds)
+        withContext(ioDispatcher) {
+            repository.purgeExpiredOnlinePlayers(serverId, expireBefore, 500)
         }
     }
 
@@ -686,6 +717,102 @@ class VoteService(
         } ?: false
     }
 
+    private fun commandSnapshot(player: Player): CommandPlayerSnapshot {
+        return CommandPlayerSnapshot(
+            uuid = player.uniqueId,
+            name = player.name,
+            canStart = player.hasPermission(config.permissions.start),
+            canVote = player.hasPermission(config.permissions.vote),
+            bypassCooldown = player.hasPermission(config.permissions.bypassCooldown),
+        )
+    }
+
+    private fun onlineSnapshotForWrite(player: Player, now: Instant): OnlinePlayerSnapshotForWrite? {
+        if (!player.isOnline) {
+            return null
+        }
+        return OnlinePlayerSnapshotForWrite(
+            uuid = player.uniqueId,
+            name = player.name,
+            exempt = player.hasPermission(config.permissions.exemptTarget),
+            serverId = serverId,
+            seenAt = now,
+        )
+    }
+
+    private suspend fun collectOnlinePlayerSnapshots(now: Instant): List<OnlinePlayerSnapshotForWrite> {
+        val playersResult = CompletableDeferred<List<Player>>()
+        scheduler.executeGlobal {
+            runCatching {
+                Bukkit.getOnlinePlayers().toList()
+            }.onSuccess(playersResult::complete)
+                .onFailure(playersResult::completeExceptionally)
+        }
+        val players = withTimeoutOrNull(3_000L) { playersResult.await() }.orEmpty()
+        if (players.isEmpty()) {
+            return emptyList()
+        }
+
+        val snapshots = Collections.synchronizedList(mutableListOf<OnlinePlayerSnapshotForWrite>())
+        val remaining = AtomicInteger(players.size)
+        val done = CompletableDeferred<List<OnlinePlayerSnapshotForWrite>>()
+        players.forEach { player ->
+            scheduler.executeFor(player) {
+                runCatching {
+                    onlineSnapshotForWrite(player, now)?.let(snapshots::add)
+                }.onFailure { exception ->
+                    plugin.logger.log(Level.FINE, "Failed to capture online player snapshot", exception)
+                }
+                if (remaining.decrementAndGet() == 0) {
+                    done.complete(snapshots.toList())
+                }
+            }
+        }
+        return withTimeoutOrNull(3_000L) { done.await() } ?: snapshots.toList()
+    }
+
+    private suspend fun findLocalOnlinePlayerSnapshot(
+        targetName: String,
+        now: Instant,
+    ): OnlinePlayerSnapshotForWrite? {
+        return collectOnlinePlayerSnapshots(now).firstOrNull { snapshot ->
+            snapshot.name.equals(targetName, ignoreCase = true)
+        }
+    }
+
+    private fun rememberOnlineSnapshots(snapshots: List<OnlinePlayerSnapshotForWrite>) {
+        snapshots.forEach { snapshot ->
+            knownOnlinePlayers.add(snapshot.uuid)
+            knownOnlinePlayerNames[snapshot.uuid] = snapshot.name
+        }
+    }
+
+    private fun forgetOnlinePlayer(uuid: UUID) {
+        knownOnlinePlayers.remove(uuid)
+        knownOnlinePlayerNames.remove(uuid)
+    }
+
+    private fun executeIfPlayerOnline(
+        playerUuid: UUID,
+        onOffline: () -> Unit = {},
+        action: (Player) -> Unit,
+    ) {
+        scheduler.executeGlobal {
+            val player = Bukkit.getPlayer(playerUuid)
+            if (player == null) {
+                onOffline()
+                return@executeGlobal
+            }
+            scheduler.executeFor(player) {
+                if (!player.isOnline) {
+                    onOffline()
+                    return@executeFor
+                }
+                action(player)
+            }
+        }
+    }
+
     private fun shouldSanction(tally: VoteTally): Boolean {
         return tally.blackVotes >= config.vote.minBlackVotesToSanction &&
             tally.blackVotes > (tally.redVotes * config.vote.blackExcessMultiplier)
@@ -744,24 +871,18 @@ class VoteService(
         }
 
         bossBars.entries.toList().forEach { (playerUuid, playerBossBars) ->
-            val player = Bukkit.getPlayer(playerUuid)
-            if (player == null || !player.isOnline) {
-                clearPlayerState(playerUuid)
-                return@forEach
-            }
+            executeIfPlayerOnline(playerUuid, onOffline = { clearPlayerState(playerUuid) }) { player ->
+                playerBossBars.keys.toList().forEach { sessionId ->
+                    val snapshot = snapshots[sessionId]
+                    if (snapshot == null) {
+                        removeBossBar(playerUuid, sessionId)
+                        return@forEach
+                    }
 
-            playerBossBars.keys.toList().forEach { sessionId ->
-                val snapshot = snapshots[sessionId]
-                if (snapshot == null) {
-                    removeBossBar(playerUuid, sessionId)
-                    return@forEach
-                }
-
-                val (session, tally) = snapshot
-                val remainingSeconds = Duration.between(now, session.expiresAt).seconds.coerceAtLeast(0L)
-                val progress = computeBossBarProgress(session, now)
-                scheduler.executeFor(player) {
-                    val current = bossBars[playerUuid]?.get(sessionId) ?: return@executeFor
+                    val (session, tally) = snapshot
+                    val remainingSeconds = Duration.between(now, session.expiresAt).seconds.coerceAtLeast(0L)
+                    val progress = computeBossBarProgress(session, now)
+                    val current = bossBars[playerUuid]?.get(sessionId) ?: return@forEach
                     current.setTitle(
                         legacyText(
                             buildBossBarTemplate(),
@@ -808,29 +929,25 @@ class VoteService(
                 return@launch
             }
 
-            val player = Bukkit.getPlayer(playerUuid)
-            if (player == null || !player.isOnline) {
-                clearPlayerState(playerUuid)
-                return@launch
-            }
-
             val (session, tally) = snapshot
             val remainingSeconds = Duration.between(now, session.expiresAt).seconds.coerceAtLeast(0L)
             val progress = computeBossBarProgress(session, now)
-            scheduler.executeFor(player) {
-                val current = bossBars[playerUuid]?.get(sessionId) ?: return@executeFor
-                current.setTitle(
-                    legacyText(
-                        buildBossBarTemplate(),
-                        "target" to session.targetName,
-                        "reason" to reasonDisplay(session.reason),
-                        "reason_description" to reasonDescription(session.reason),
-                        "red" to tally.redVotes,
-                        "black" to tally.blackVotes,
-                        "seconds" to remainingSeconds,
-                    ),
-                )
-                current.progress = progress
+            executeIfPlayerOnline(playerUuid, onOffline = { clearPlayerState(playerUuid) }) {
+                val current = bossBars[playerUuid]?.get(sessionId)
+                if (current != null) {
+                    current.setTitle(
+                        legacyText(
+                            buildBossBarTemplate(),
+                            "target" to session.targetName,
+                            "reason" to reasonDisplay(session.reason),
+                            "reason_description" to reasonDescription(session.reason),
+                            "red" to tally.redVotes,
+                            "black" to tally.blackVotes,
+                            "seconds" to remainingSeconds,
+                        ),
+                    )
+                    current.progress = progress
+                }
             }
         }
     }
@@ -852,12 +969,10 @@ class VoteService(
     private fun clearPlayerState(playerUuid: UUID) {
         deliveredSessions.remove(playerUuid)
         bossBars.remove(playerUuid)?.let { playerBossBars ->
-            Bukkit.getPlayer(playerUuid)?.let { player ->
-                scheduler.executeFor(player) {
-                    playerBossBars.values.forEach { bossBar ->
-                        bossBar.removePlayer(player)
-                        bossBar.isVisible = false
-                    }
+            executeIfPlayerOnline(playerUuid) { player ->
+                playerBossBars.values.forEach { bossBar ->
+                    bossBar.removePlayer(player)
+                    bossBar.isVisible = false
                 }
             }
         }
@@ -875,11 +990,9 @@ class VoteService(
         if (playerBossBars.isEmpty()) {
             bossBars.remove(playerUuid, playerBossBars)
         }
-        Bukkit.getPlayer(playerUuid)?.let { player ->
-            scheduler.executeFor(player) {
-                tracked.removePlayer(player)
-                tracked.isVisible = false
-            }
+        executeIfPlayerOnline(playerUuid) { player ->
+            tracked.removePlayer(player)
+            tracked.isVisible = false
         }
     }
 

@@ -3,6 +3,7 @@ package ym.ballotcraft.storage
 import org.bukkit.configuration.file.YamlConfiguration
 import org.bukkit.plugin.java.JavaPlugin
 import ym.ballotcraft.model.OnlinePlayerSnapshot
+import ym.ballotcraft.model.OnlinePlayerSnapshotForWrite
 import ym.ballotcraft.model.StartVoteResult
 import ym.ballotcraft.model.VoteChoice
 import ym.ballotcraft.model.VoteRecord
@@ -246,27 +247,39 @@ class YamlVoteRepository(
         }
     }
 
-    override suspend fun heartbeatOnlinePlayer(
+    override suspend fun heartbeatOnlinePlayersBatch(
         serverId: String,
-        playerUuid: UUID,
-        playerName: String,
-        exemptFromVote: Boolean,
+        snapshots: List<OnlinePlayerSnapshotForWrite>,
         now: Instant,
     ) {
+        if (snapshots.isEmpty()) {
+            return
+        }
         synchronized(lock) {
-            val path = "online-players.$playerUuid"
-            config.set("$path.server-id", serverId)
-            config.set("$path.player-uuid", playerUuid.toString())
-            config.set("$path.player-name", playerName)
-            config.set("$path.exempt-from-vote", exemptFromVote)
-            config.set("$path.last-seen-at", now.toEpochMilli())
+            snapshots.forEach { snapshot ->
+                val path = "online-players.${snapshot.uuid}"
+                config.set("$path.server-id", snapshot.serverId.ifBlank { serverId })
+                config.set("$path.player-uuid", snapshot.uuid.toString())
+                config.set("$path.player-name", snapshot.name)
+                config.set("$path.exempt-from-vote", snapshot.exempt)
+                val seenAt = snapshot.seenAt.takeUnless { it == Instant.EPOCH } ?: now
+                config.set("$path.last-seen-at", seenAt.toEpochMilli())
+            }
             saveLocked()
         }
     }
 
-    override suspend fun removeOnlinePlayer(serverId: String, playerUuid: UUID) {
+    override suspend fun removeOnlinePlayersBatch(serverId: String, uuids: Collection<UUID>) {
+        if (uuids.isEmpty()) {
+            return
+        }
         synchronized(lock) {
-            config.set("online-players.$playerUuid", null)
+            uuids.forEach { playerUuid ->
+                val path = "online-players.$playerUuid"
+                if (serverId == config.getString("$path.server-id")) {
+                    config.set(path, null)
+                }
+            }
             saveLocked()
         }
     }
@@ -292,19 +305,30 @@ class YamlVoteRepository(
         }
     }
 
-    override suspend fun purgeExpiredOnlinePlayers(expireBefore: Instant) {
-        synchronized(lock) {
+    override suspend fun purgeExpiredOnlinePlayers(serverId: String, expireBefore: Instant, limit: Int): Int {
+        return synchronized(lock) {
             var changed = false
+            var removed = 0
             onlinePlayerMap().values.forEach { path ->
+                if (removed >= limit.coerceAtLeast(1)) {
+                    return@forEach
+                }
                 val lastSeenAt = config.getLong("$path.last-seen-at", Long.MIN_VALUE)
-                if (lastSeenAt != Long.MIN_VALUE && Instant.ofEpochMilli(lastSeenAt).isBefore(expireBefore)) {
+                val storedServerId = config.getString("$path.server-id")
+                if (
+                    serverId == storedServerId &&
+                    lastSeenAt != Long.MIN_VALUE &&
+                    Instant.ofEpochMilli(lastSeenAt).isBefore(expireBefore)
+                ) {
                     config.set(path, null)
                     changed = true
+                    removed++
                 }
             }
             if (changed) {
                 saveLocked()
             }
+            removed
         }
     }
 

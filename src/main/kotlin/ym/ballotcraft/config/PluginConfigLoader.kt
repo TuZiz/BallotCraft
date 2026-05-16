@@ -51,6 +51,7 @@ object PluginConfigLoader {
             openSeconds = config.getLong("vote.open-seconds", 120L),
             syncPollSeconds = config.getLong("vote.sync-poll-seconds", 5L),
             onlineHeartbeatSeconds = config.getLong("vote.online-heartbeat-seconds", 5L).coerceAtLeast(1L),
+            onlineCleanupSeconds = config.getLong("vote.online-cleanup-seconds", 60L).coerceAtLeast(10L),
             onlineExpireSeconds = config.getLong("vote.online-expire-seconds", 30L).coerceAtLeast(5L),
             blackExcessMultiplier = config.getDouble("vote.black-excess-multiplier", 2.0),
             minBlackVotesToSanction = config.getInt("vote.min-black-votes-to-sanction", 3).coerceAtLeast(1),

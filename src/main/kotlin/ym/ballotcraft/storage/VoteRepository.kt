@@ -3,6 +3,7 @@ package ym.ballotcraft.storage
 import ym.ballotcraft.model.StartVoteResult
 import ym.ballotcraft.model.VoteChoice
 import ym.ballotcraft.model.OnlinePlayerSnapshot
+import ym.ballotcraft.model.OnlinePlayerSnapshotForWrite
 import ym.ballotcraft.model.VoteRecord
 import ym.ballotcraft.model.VoteResolution
 import ym.ballotcraft.model.VoteResolutionType
@@ -77,17 +78,15 @@ interface VoteRepository {
 
     suspend fun markResolutionDelivered(sessionId: Long, serverId: String)
 
-    suspend fun heartbeatOnlinePlayer(
+    suspend fun heartbeatOnlinePlayersBatch(
         serverId: String,
-        playerUuid: UUID,
-        playerName: String,
-        exemptFromVote: Boolean,
+        snapshots: List<OnlinePlayerSnapshotForWrite>,
         now: Instant,
     )
 
-    suspend fun removeOnlinePlayer(serverId: String, playerUuid: UUID)
+    suspend fun removeOnlinePlayersBatch(serverId: String, uuids: Collection<UUID>)
 
     suspend fun findOnlinePlayerByName(name: String, now: Instant): OnlinePlayerSnapshot?
 
-    suspend fun purgeExpiredOnlinePlayers(expireBefore: Instant)
+    suspend fun purgeExpiredOnlinePlayers(serverId: String, expireBefore: Instant, limit: Int): Int
 }

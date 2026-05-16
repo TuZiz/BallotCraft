@@ -1,6 +1,7 @@
 package ym.ballotcraft.storage
 
 import ym.ballotcraft.model.OnlinePlayerSnapshot
+import ym.ballotcraft.model.OnlinePlayerSnapshotForWrite
 import ym.ballotcraft.model.StartVoteResult
 import ym.ballotcraft.model.VoteChoice
 import ym.ballotcraft.model.VoteRecord
@@ -47,6 +48,7 @@ class DatabaseVoteRepository(
                         sanction_executed TINYINT(1) NOT NULL DEFAULT 0,
                         active_token VARCHAR(64) DEFAULT NULL,
                         INDEX idx_target_active (target_uuid, closed, expires_at),
+                        INDEX idx_sessions_closed_expires (closed, expires_at),
                         UNIQUE KEY uk_active_token (active_token)
                     )
                     """.trimIndent(),
@@ -84,7 +86,8 @@ class DatabaseVoteRepository(
                         exempt_from_vote TINYINT(1) NOT NULL DEFAULT 0,
                         last_seen_at TIMESTAMP NOT NULL,
                         INDEX idx_online_name (player_name),
-                        INDEX idx_online_seen (last_seen_at)
+                        INDEX idx_online_seen (last_seen_at),
+                        INDEX idx_online_server_seen (server_id, last_seen_at)
                     )
                     """.trimIndent(),
                 )
@@ -130,6 +133,8 @@ class DatabaseVoteRepository(
             )
             ensureColumn(connection, sessionsTable, "active_token", "ALTER TABLE $sessionsTable ADD COLUMN active_token VARCHAR(64) DEFAULT NULL")
             ensureIndex(connection, sessionsTable, "uk_active_token", "ALTER TABLE $sessionsTable ADD UNIQUE KEY uk_active_token (active_token)")
+            ensureIndex(connection, sessionsTable, "idx_sessions_closed_expires", "ALTER TABLE $sessionsTable ADD INDEX idx_sessions_closed_expires (closed, expires_at)")
+            ensureIndex(connection, onlinePlayersTable, "idx_online_server_seen", "ALTER TABLE $onlinePlayersTable ADD INDEX idx_online_server_seen (server_id, last_seen_at)")
             backfillActiveTokens(connection)
             cleanupResolvedDeliveries(connection)
         }
@@ -268,7 +273,8 @@ class DatabaseVoteRepository(
                 choice = VALUES(choice),
                 voted_at = VALUES(voted_at)
         """.trimIndent()
-        return database.connection().use { connection ->
+        return withDeadlockRetry("upsert vote") {
+            database.connection().use { connection ->
             connection.prepareStatement(sql).use { statement ->
                 statement.setString(1, voterUuid.toString())
                 statement.setString(2, voterName)
@@ -282,6 +288,7 @@ class DatabaseVoteRepository(
                 }
             }
             tallyInternal(connection, sessionId)
+            }
         }
     }
 
@@ -291,11 +298,13 @@ class DatabaseVoteRepository(
             VALUES (?, ?)
             ON DUPLICATE KEY UPDATE last_started_at = VALUES(last_started_at)
         """.trimIndent()
-        database.connection().use { connection ->
+        withDeadlockRetry("update starter cooldown") {
+            database.connection().use { connection ->
             connection.prepareStatement(sql).use { statement ->
                 statement.setString(1, starterUuid.toString())
                 statement.setTimestamp(2, Timestamp.from(startedAt))
                 statement.executeUpdate()
+            }
             }
         }
     }
@@ -317,7 +326,8 @@ class DatabaseVoteRepository(
         blackExcessMultiplier: Double,
         minBlackVotesToSanction: Int,
     ): List<VoteResolution> {
-        return database.connection().use { connection ->
+        return withDeadlockRetry("resolve expired sessions") {
+            database.connection().use { connection ->
             connection.autoCommit = false
             try {
                 val selectSql = """
@@ -357,6 +367,7 @@ class DatabaseVoteRepository(
             } finally {
                 connection.autoCommit = true
             }
+            }
         }
     }
 
@@ -366,7 +377,8 @@ class DatabaseVoteRepository(
         resolvedAt: Instant,
         type: VoteResolutionType,
     ): VoteResolution? {
-        return database.connection().use { connection ->
+        return withDeadlockRetry("try resolve session") {
+            database.connection().use { connection ->
             connection.autoCommit = false
             try {
                 val session = lockSession(connection, sessionId) ?: run {
@@ -381,6 +393,7 @@ class DatabaseVoteRepository(
                 throw exception
             } finally {
                 connection.autoCommit = true
+            }
             }
         }
     }
@@ -420,23 +433,26 @@ class DatabaseVoteRepository(
             VALUES (?, ?, ?)
             ON DUPLICATE KEY UPDATE delivered_at = VALUES(delivered_at)
         """.trimIndent()
-        database.connection().use { connection ->
+        withDeadlockRetry("mark resolution delivered") {
+            database.connection().use { connection ->
             connection.prepareStatement(sql).use { statement ->
                 statement.setLong(1, sessionId)
                 statement.setString(2, serverId)
                 statement.setTimestamp(3, Timestamp.from(Instant.now()))
                 statement.executeUpdate()
             }
+            }
         }
     }
 
-    override suspend fun heartbeatOnlinePlayer(
+    override suspend fun heartbeatOnlinePlayersBatch(
         serverId: String,
-        playerUuid: UUID,
-        playerName: String,
-        exemptFromVote: Boolean,
+        snapshots: List<OnlinePlayerSnapshotForWrite>,
         now: Instant,
     ) {
+        if (snapshots.isEmpty()) {
+            return
+        }
         val sql = """
             INSERT INTO $onlinePlayersTable (player_uuid, player_name, server_id, exempt_from_vote, last_seen_at)
             VALUES (?, ?, ?, ?, ?)
@@ -446,32 +462,63 @@ class DatabaseVoteRepository(
                 exempt_from_vote = VALUES(exempt_from_vote),
                 last_seen_at = VALUES(last_seen_at)
         """.trimIndent()
-        database.connection().use { connection ->
-            connection.prepareStatement(sql).use { statement ->
-                statement.setString(1, playerUuid.toString())
-                statement.setString(2, playerName)
-                statement.setString(3, serverId)
-                statement.setBoolean(4, exemptFromVote)
-                statement.setTimestamp(5, Timestamp.from(now))
-                statement.executeUpdate()
+        withDeadlockRetry("heartbeat online players batch") {
+            database.connection().use { connection ->
+                connection.autoCommit = false
+                try {
+                    connection.prepareStatement(sql).use { statement ->
+                        snapshots.forEach { snapshot ->
+                            statement.setString(1, snapshot.uuid.toString())
+                            statement.setString(2, snapshot.name)
+                            statement.setString(3, snapshot.serverId.ifBlank { serverId })
+                            statement.setBoolean(4, snapshot.exempt)
+                            statement.setTimestamp(5, Timestamp.from(snapshot.seenAt.takeUnless { it == Instant.EPOCH } ?: now))
+                            statement.addBatch()
+                        }
+                        statement.executeBatch()
+                    }
+                    connection.commit()
+                } catch (exception: Exception) {
+                    connection.rollback()
+                    throw exception
+                } finally {
+                    connection.autoCommit = true
+                }
             }
         }
     }
 
-    override suspend fun removeOnlinePlayer(serverId: String, playerUuid: UUID) {
+    override suspend fun removeOnlinePlayersBatch(serverId: String, uuids: Collection<UUID>) {
+        if (uuids.isEmpty()) {
+            return
+        }
         val sql = "DELETE FROM $onlinePlayersTable WHERE player_uuid = ? AND server_id = ?"
-        database.connection().use { connection ->
-            connection.prepareStatement(sql).use { statement ->
-                statement.setString(1, playerUuid.toString())
-                statement.setString(2, serverId)
-                statement.executeUpdate()
+        withDeadlockRetry("remove online players batch") {
+            database.connection().use { connection ->
+                connection.autoCommit = false
+                try {
+                    connection.prepareStatement(sql).use { statement ->
+                        uuids.forEach { playerUuid ->
+                            statement.setString(1, playerUuid.toString())
+                            statement.setString(2, serverId)
+                            statement.addBatch()
+                        }
+                        statement.executeBatch()
+                    }
+                    connection.commit()
+                } catch (exception: Exception) {
+                    connection.rollback()
+                    throw exception
+                } finally {
+                    connection.autoCommit = true
+                }
             }
         }
     }
 
     override suspend fun findOnlinePlayerByName(name: String, now: Instant): OnlinePlayerSnapshot? {
         val sql = """
-            SELECT player_uuid, player_name
+            SELECT player_uuid, player_name, exempt_from_vote
             FROM $onlinePlayersTable
             WHERE LOWER(player_name) = LOWER(?) AND last_seen_at > ?
             ORDER BY last_seen_at DESC
@@ -496,12 +543,16 @@ class DatabaseVoteRepository(
         }
     }
 
-    override suspend fun purgeExpiredOnlinePlayers(expireBefore: Instant) {
-        val sql = "DELETE FROM $onlinePlayersTable WHERE last_seen_at < ?"
-        database.connection().use { connection ->
-            connection.prepareStatement(sql).use { statement ->
-                statement.setTimestamp(1, Timestamp.from(expireBefore))
-                statement.executeUpdate()
+    override suspend fun purgeExpiredOnlinePlayers(serverId: String, expireBefore: Instant, limit: Int): Int {
+        val sql = "DELETE FROM $onlinePlayersTable WHERE server_id = ? AND last_seen_at < ? LIMIT ?"
+        return withDeadlockRetry("purge expired online players") {
+            database.connection().use { connection ->
+                connection.prepareStatement(sql).use { statement ->
+                    statement.setString(1, serverId)
+                    statement.setTimestamp(2, Timestamp.from(expireBefore))
+                    statement.setInt(3, limit.coerceAtLeast(1))
+                    statement.executeUpdate()
+                }
             }
         }
     }
@@ -522,7 +573,8 @@ class DatabaseVoteRepository(
             (target_uuid, target_name, started_by_uuid, started_by_name, reason, created_at, expires_at, closed, sanction_executed, active_token)
             VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?)
         """.trimIndent()
-        return database.connection().use { connection ->
+        return withDeadlockRetry("create vote session") {
+            database.connection().use { connection ->
             try {
                 connection.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS).use { statement ->
                     statement.setString(1, targetUuid.toString())
@@ -559,6 +611,7 @@ class DatabaseVoteRepository(
                 } else {
                     throw exception
                 }
+            }
             }
         }
     }
@@ -735,6 +788,38 @@ class DatabaseVoteRepository(
 
     private fun isDuplicateKey(exception: SQLException): Boolean {
         return exception.sqlState == "23000" || exception.errorCode == 1062
+    }
+
+    private fun <T> withDeadlockRetry(operation: String, block: () -> T): T {
+        var attempt = 0
+        var delayMillis = 50L
+        while (true) {
+            try {
+                return block()
+            } catch (exception: SQLException) {
+                if (!isDeadlockOrLockTimeout(exception) || attempt >= 3) {
+                    throw exception
+                }
+                attempt++
+                logger.warning(
+                    "BallotCraft retrying $operation after MySQL lock conflict " +
+                        "(attempt $attempt/3, sqlState=${exception.sqlState}, errorCode=${exception.errorCode})",
+                )
+                Thread.sleep(delayMillis)
+                delayMillis *= 2L
+            }
+        }
+    }
+
+    private fun isDeadlockOrLockTimeout(exception: SQLException): Boolean {
+        var current: SQLException? = exception
+        while (current != null) {
+            if (current.sqlState == "40001" || current.errorCode == 1213 || current.errorCode == 1205) {
+                return true
+            }
+            current = current.nextException
+        }
+        return false
     }
 
     private fun ResultSet.toSession(): VoteSession {

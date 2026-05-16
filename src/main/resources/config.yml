@@ -34,6 +34,7 @@ vote:
   sync-poll-seconds: 5
   # MySQL 多服模式下，在线玩家心跳上报间隔与过期清理时间。
   online-heartbeat-seconds: 5
+  online-cleanup-seconds: 60
   online-expire-seconds: 30
   # 需要同时满足“黑票超过红票倍数”与“黑票至少达到最低票数”才会自动制裁。
   black-excess-multiplier: 2.0

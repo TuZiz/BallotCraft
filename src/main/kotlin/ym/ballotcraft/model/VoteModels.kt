@@ -62,3 +62,11 @@ data class OnlinePlayerSnapshot(
     val playerName: String,
     val exemptFromVote: Boolean,
 )
+
+data class OnlinePlayerSnapshotForWrite(
+    val uuid: UUID,
+    val name: String,
+    val exempt: Boolean,
+    val serverId: String,
+    val seenAt: Instant,
+)
