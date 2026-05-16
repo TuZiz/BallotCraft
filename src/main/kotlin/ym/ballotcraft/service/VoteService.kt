@@ -399,8 +399,9 @@ class VoteService(
         if (!config.storage.usesMysql) {
             return null
         }
+        val expireAfter = now.minusSeconds(config.vote.onlineExpireSeconds)
         return withContext(ioDispatcher) {
-            repository.findOnlinePlayerByName(targetName, now)
+            repository.findOnlinePlayerByName(targetName, expireAfter)
         }
     }
 

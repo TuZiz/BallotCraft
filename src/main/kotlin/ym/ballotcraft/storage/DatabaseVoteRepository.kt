@@ -1,5 +1,6 @@
 package ym.ballotcraft.storage
 
+import kotlinx.coroutines.delay
 import ym.ballotcraft.model.OnlinePlayerSnapshot
 import ym.ballotcraft.model.OnlinePlayerSnapshotForWrite
 import ym.ballotcraft.model.StartVoteResult
@@ -333,6 +334,8 @@ class DatabaseVoteRepository(
                 val selectSql = """
                     SELECT * FROM $sessionsTable
                     WHERE closed = 0 AND expires_at <= ?
+                    ORDER BY expires_at ASC
+                    LIMIT 20
                     FOR UPDATE
                 """.trimIndent()
                 val sessions = mutableListOf<VoteSession>()
@@ -516,7 +519,7 @@ class DatabaseVoteRepository(
         }
     }
 
-    override suspend fun findOnlinePlayerByName(name: String, now: Instant): OnlinePlayerSnapshot? {
+    override suspend fun findOnlinePlayerByName(name: String, expireAfter: Instant): OnlinePlayerSnapshot? {
         val sql = """
             SELECT player_uuid, player_name, exempt_from_vote
             FROM $onlinePlayersTable
@@ -527,7 +530,7 @@ class DatabaseVoteRepository(
         return database.connection().use { connection ->
             connection.prepareStatement(sql).use { statement ->
                 statement.setString(1, name)
-                statement.setTimestamp(2, Timestamp.from(now.minusSeconds(30)))
+                statement.setTimestamp(2, Timestamp.from(expireAfter))
                 statement.executeQuery().use { resultSet ->
                     if (resultSet.next()) {
                         OnlinePlayerSnapshot(
@@ -557,7 +560,7 @@ class DatabaseVoteRepository(
         }
     }
 
-    private fun createSessionInternal(
+    private suspend fun createSessionInternal(
         targetUuid: UUID,
         targetName: String,
         startedByUuid: UUID,
@@ -790,7 +793,7 @@ class DatabaseVoteRepository(
         return exception.sqlState == "23000" || exception.errorCode == 1062
     }
 
-    private fun <T> withDeadlockRetry(operation: String, block: () -> T): T {
+    private suspend fun <T> withDeadlockRetry(operation: String, block: suspend () -> T): T {
         var attempt = 0
         var delayMillis = 50L
         while (true) {
@@ -805,7 +808,7 @@ class DatabaseVoteRepository(
                     "BallotCraft retrying $operation after MySQL lock conflict " +
                         "(attempt $attempt/3, sqlState=${exception.sqlState}, errorCode=${exception.errorCode})",
                 )
-                Thread.sleep(delayMillis)
+                delay(delayMillis)
                 delayMillis *= 2L
             }
         }

@@ -86,7 +86,7 @@ interface VoteRepository {
 
     suspend fun removeOnlinePlayersBatch(serverId: String, uuids: Collection<UUID>)
 
-    suspend fun findOnlinePlayerByName(name: String, now: Instant): OnlinePlayerSnapshot?
+    suspend fun findOnlinePlayerByName(name: String, expireAfter: Instant): OnlinePlayerSnapshot?
 
     suspend fun purgeExpiredOnlinePlayers(serverId: String, expireBefore: Instant, limit: Int): Int
 }

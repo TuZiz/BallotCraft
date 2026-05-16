@@ -284,12 +284,12 @@ class YamlVoteRepository(
         }
     }
 
-    override suspend fun findOnlinePlayerByName(name: String, now: Instant): OnlinePlayerSnapshot? {
+    override suspend fun findOnlinePlayerByName(name: String, expireAfter: Instant): OnlinePlayerSnapshot? {
         return synchronized(lock) {
             onlinePlayerMap().values
                 .mapNotNull { path ->
                     val lastSeenAt = config.getLong("$path.last-seen-at", Long.MIN_VALUE)
-                    if (lastSeenAt == Long.MIN_VALUE || Instant.ofEpochMilli(lastSeenAt).isBefore(now.minusSeconds(30))) {
+                    if (lastSeenAt == Long.MIN_VALUE || !Instant.ofEpochMilli(lastSeenAt).isAfter(expireAfter)) {
                         null
                     } else {
                         val playerName = config.getString("$path.player-name") ?: return@mapNotNull null
