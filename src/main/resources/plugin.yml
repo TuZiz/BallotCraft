@@ -1,0 +1,27 @@
+name: BallotCraft
+version: '${project.version}'
+main: ym.ballotcraft.BallotCraftPlugin
+api-version: '1.21'
+folia-supported: true
+authors: [ ymxc ]
+commands:
+  ballotcraft:
+    description: BallotCraft vote command
+    usage: /ballotcraft start <player> [reason]
+    aliases: [ ballot, bcvote ]
+permissions:
+  ballotcraft.start:
+    description: Allow starting a vote
+    default: op
+  ballotcraft.vote:
+    description: Allow casting a vote
+    default: true
+  ballotcraft.notify:
+    description: Allow receiving bossbar vote notifications
+    default: true
+  ballotcraft.bypasscooldown:
+    description: Bypass vote start cooldown
+    default: op
+  ballotcraft.exempttarget:
+    description: Prevent being targeted by votes
+    default: op

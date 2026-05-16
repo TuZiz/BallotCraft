@@ -1,0 +1,81 @@
+# BallotCraft 主配置
+
+lang-file: "lang/zh_cn.yml"
+
+storage:
+  # 可选: yaml / mysql
+  type: "yaml"
+  yaml-file: "data/votes.yml"
+
+# 只有 storage.type = mysql 时才会使用下面的数据库配置。
+database:
+  # 多服共库时每台服务器都必须填写唯一的 server-id，用于同步去重与在线心跳标识。
+  server-id: "server-1"
+  host: "127.0.0.1"
+  port: 3306
+  name: "ballotcraft"
+  username: "root"
+  password: "change-me"
+  table-prefix: "ballotcraft_"
+  pool-size: 10
+  connection-timeout-millis: 10000
+
+# 这里只是权限节点映射，用于统一修改插件检查的权限名，不是功能开关。
+permissions:
+  start: "ballotcraft.start"
+  vote: "ballotcraft.vote"
+  notify: "ballotcraft.notify"
+  bypass-cooldown: "ballotcraft.bypasscooldown"
+  exempt-target: "ballotcraft.exempttarget"
+
+vote:
+  cooldown-seconds: 600
+  open-seconds: 120
+  sync-poll-seconds: 5
+  # MySQL 多服模式下，在线玩家心跳上报间隔与过期清理时间。
+  online-heartbeat-seconds: 5
+  online-expire-seconds: 30
+  # 需要同时满足“黑票超过红票倍数”与“黑票至少达到最低票数”才会自动制裁。
+  black-excess-multiplier: 2.0
+  min-black-votes-to-sanction: 6
+  allow-vote-change: true
+  # 配置化投票理由。玩家发起投票时只能从这里选择理由键，并按对应指令执行制裁。
+  reasons:
+    grief:
+      display-name: "恶意破坏"
+      display-color: "#FF6B6B"
+      description: "恶意破坏他人建筑或设施"
+      aliases: [ "破坏" ]
+      sanction-command: "tempban {player} 1d 恶意破坏"
+    harassment:
+      display-name: "恶意骚扰"
+      display-color: "#FF9F43"
+      description: "持续骚扰、影响其他玩家正常游戏"
+      aliases: [ "骚扰" ]
+      sanction-command: "tempban {player} 12h 恶意骚扰"
+    theft:
+      display-name: "偷窃行为"
+      display-color: "#54A0FF"
+      description: "偷拿他人物品或恶意掠夺资源"
+      aliases: [ "偷窃" ]
+      sanction-command: "tempban {player} 2d 偷窃行为"
+    brat:
+      display-name: "熊孩子"
+      display-color: "#F368E0"
+      description: "持续捣乱、恶作剧或影响他人正常游玩"
+      aliases: [ "熊孩" ]
+      sanction-command: "tempban {player} 1d 熊孩子行为"
+    bad-language:
+      display-name: "不良语言"
+      display-color: "#FF9FF3"
+      description: "辱骂、引战、刷屏或发布不良言论"
+      aliases: [ "脏话" ]
+      sanction-command: "cmi mute {player} 禁言 60m"
+
+bossbar:
+  enabled: true
+  title: "<#FF5555>正在投票：<#FFFFFF>{target} <#A4B0BE>| <#ECCC68>{reason} <#A4B0BE>| <#FF4757>黑 {black} <#A4B0BE>| <#2ED573>红 {red} <#A4B0BE>| <#FFD166>{seconds}s"
+  color: "RED"
+  overlay: "PROGRESS"
+  progress: 1.0
+  update-interval-ticks: 20
